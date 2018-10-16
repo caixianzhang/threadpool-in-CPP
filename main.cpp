@@ -6,41 +6,41 @@
 #include "main.h"
 #include "threadpool.h"
 
-void *p(void *arg)
-{
-	for(int i = 0; i < *((int *)arg); i++)
-	{
-		printf("%d\n", *((int *)arg));
-		sleep(1);
-	}
-	printf("exit %d\n",*((int *)arg));
-	return (void *)0;
-}
-
-void *Monitor_System(void *arg)
-{
-	pthread_detach(pthread_self());
-	while(1)
-	{
-		monitor_pthread_pool();
-		sleep(2);
-	}
-	return (void *)0;
-}
-
-pthread_t monitor;
+class Test:public Task_Node{
+	private:
+		int printtimes;
+	public:
+		Test(int printtimes)
+		{
+			this->printtimes = printtimes;
+		}
+		~Test()
+		{
+			
+		}
+		void run()
+		{
+			for(int i = 0; i < 10; i++)
+			{
+				//printf("%d\n", printtimes);
+				sleep(1);
+			}
+		}
+};
+		
 int main(int argc, char **argv)
 {
-	init_pthread_pool();
-	pthread_create(&monitor, NULL, Monitor_System, NULL);
-	for(int i = 0; i < 45; i++)
+	ThreadPool *MyThreadPool = new ThreadPool();
+
+	for(int i = 0;i < 1000; i++)
 	{
-		task_node *temp_task = (task_node *)malloc(sizeof(task_node));
-		temp_task->arg = (int *)malloc(sizeof(int));
-		*((int *)temp_task->arg) = i + 10;
-		temp_task->func = p;
-		AddTaskToQueue(temp_task);
+		MyThreadPool->Add_Task_To_ThreadPool(new Test(i));		
 	}
-	while(1);
+	sleep(3);
+	MyThreadPool->Clear_Thread();
+	sleep(3);
+	MyThreadPool->Add_Thread();
+	MyThreadPool->Add_Thread();
+	sleep(10000);
 	return 0;
 }

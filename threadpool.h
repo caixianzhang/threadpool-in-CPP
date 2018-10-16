@@ -3,118 +3,45 @@
 
 #include <semaphore.h>
 
-////////////////////////////////////////////////////////////////
-//	C语言版本
-////////////////////////////////////////////////////////////////
-
-
-#define TASK_MAX_NUM	100
-#define THREAD_IDLE_REDUNDANCE_MAX	50
-#define THREAD_IDLE_REDUNDANCE_MIN	3
-#define THREAD_DEF_NUM	20
-
-typedef struct TASK_NODE{
-	pthread_mutex_t mutex;
-	void *arg;
-	void *(*func)(void *);
-	pthread_t pid;
-	int work_id;
-	int is_work;
-	struct TASK_NODE *next;
-}task_node;
-
-typedef struct TASK_PARAMETER{
-		void *arg;
-		void *(*func)(void *);
-}task_parameter;
-
-typedef struct TASK_QUEUE{
-	int task_queue_size;
-	pthread_mutex_t mutex;
-	sem_t NewTaskToExecute;
-	struct TASK_NODE *head;
-	struct TASK_NODE *rear;
-}task_queue;
-
-typedef struct PTHREAD_NODE{
-	pthread_cond_t cond;
-	pthread_mutex_t mutex;
-	pthread_t pid;
-	int is_execute_task;
-	int pthread_exit_flag;
-	struct TASK_NODE *task;
-	struct PTHREAD_NODE *next;
-}pthread_node;
-
-typedef struct PTHREAD_QUEUE{
-	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-	int pthread_queue_size;
-	struct PTHREAD_NODE *head;
-	struct PTHREAD_NODE *rear;
-}pthread_queue;
-
-void *single_pthread_work(void *arg);
-int create_pthread_pool();
-void *pthread_manager(void *arg);
-int init_pthread_pool();
-int AddTaskToQueue(task_node *NewTask);
-void monitor_pthread_pool();
-
-
-////////////////////////////////////////////////////////////////
-//	C++语言版本
-////////////////////////////////////////////////////////////////
-
 //任务节点
 class Task_Node{
 	private:
 		//访问该任务节点的锁
-		pthread_mutex_t Task_Node_Mutex;
+		pthread_mutex_t mutex;
 
 		//具体要执行的任务的参数，任务执行完毕后，参数内存由调用者释放
-		//struct Task_Param *Param;
-		void *Task_Arg;
-		
-		//执行该任务的线程ID
-		pthread_t Thread_ID;
-
-		//该任务的标记序号
-		int Task_ID;
-
-		//该任务是否开始执行
-		bool Is_Task_Work;
+		void *arg;
 
 		//该任务在队列中的下一个节点
-		Task_Node *Next_Task;
+		Task_Node *next;
 
 	public:
 		Task_Node();
 		virtual ~Task_Node();
 
-		inline void Set_Thread_ID(pthread_t Thread_ID);
-		inline void Set_Task_ID(int Task_ID);
-		inline void Set_Is_Work(bool Is_Task_Work);
-		inline void Set_Next_Task(Task_Node *Next_Task);
+		inline void lock();
+		inline void unlock();
 		
-		inline void Set_Task_Arg(void *Task_Arg);
-		inline void *Get_Task_Arg();
-		virtual void run(void *arg) = 0;
+		inline void Set_next(Task_Node *next);
+		inline Task_Node *Get_next();
+		inline void Set_arg(void *arg);
+		inline void *Get_arg();
+		virtual void run() = 0;
 };
 	
 //任务队列
 class Task_Queue{
 	private:
+		//访问任务队列锁
+		pthread_mutex_t mutex;
 		enum Queue_Size{Task_Max_Num = 1000};
 		//任务队列大小
-		int Task_Queue_Size;
-		//访问任务队列锁
-		pthread_mutex_t Task_Queue_Mutex;
+		int size;
 		//任务队列信号量
-		sem_t Task_To_Execute;
+		sem_t sem;
 		//任务队列头尾节点
-		Task_Queue *Head_Task;
-		Task_Queue *Rear_Task;	
+		Task_Node *head;
+		Task_Node *rear;	
 
 	public:
 		Task_Queue();
@@ -124,85 +51,100 @@ class Task_Queue{
 		inline void wait();
 		inline void post();
 		inline void unlock();
+
+		//向任务队列中添加任务
+		bool Add_Task(Task_Node *task);
 		
-		void Add_Task(Task_Node *Temp_Task);
+		//从任务队列中取出任务
 		Task_Node *Get_Task();
 
 		//获取队列大小
-		inline int Get_Task_Queue_Size();
+		inline int Get_size();
 
 		//队列大小加一
-		inline void Inc_Task_Queue_Size();
+		inline void Inc_size();
 		//队列大小减一
-		inline void Dec_Task_Queue_Size();
+		inline void Dec_size();
 };
 
-//单个线程的属性
-class Thread{
+class Thread_Queue;
+/*
+	线程节点
+*/
+class Thread_Node{
 	private:
 		//单个线程唤醒条件变量
-		pthread_cond_t Thread_Cond;
+		pthread_cond_t cond;
 
 		//修改单个线程属性的线程锁
-		pthread_mutex_t Thread_Mutex;
+		pthread_mutex_t mutex;
 
 		//单个线程的线程ID
 		pthread_t Thread_Pid;
 
-		//该线程是否在执行任务
-		bool Is_Execute_Task;
-
+		//是否有任务执行
+		bool Task_Flag;
+		
 		//任务执行完毕后是否退出
-		bool Thread_Exit_Flag;
+		bool Exit_Flag;
 
 		//分配给该线程的任务
-		Task_Node *Thread_Task;
+		Task_Node *task;
 
-		//空闲线程队列
+		//空闲线程队列指针
 		Thread_Queue *Idle_Thread_Queue;
 			
 		//在线程队列中的下一个线程
-		Thread *Next_Thread;
-		
-	public:
-		Thread(Thread_Queue *Idle_Thread_Queue);
-		virtual ~Thread();	
+		Thread_Node *next;
 
+		//单个线程实际开始工作
+		static void *Thread_Work(void *arg);
+	public:
+		Thread_Node(Thread_Queue *Idle_Thread_Queue);
+		virtual ~Thread_Node();	
+
+		inline void Start();
 		inline void lock();
 		inline void wait();
 		inline void signal();
 		inline void unlock();
 
-		inline void Set_Thread_Task(Task_Node *Thread_Task);
-	
-		inline bool Set_Execute_Task_Flag(bool Is_Execute_Task);
-		inline bool Get_Execute_Task_Flag();
+		//设置该线程节点需要执行的任务
+		inline void Set_task(Task_Node *task);
 
-		inline bool Set_Thread_Exit(bool Thread_Exit_Flag);
-		inline bool Get_Thread_Exit();
+		//设置线程有任务执行标志
+		inline void Set_Task_Flag(bool Task_Flag);
+		//读取线程是否有任务执行标志
+		inline bool Get_Task_Flag();
 
-		inline void Set_Next_Thread(Thread *Next_Thread);
+		//设置线程退出标志
+		inline void Set_Exit_Flag(bool Exit_Flag);
+		//读取线程退出标志
+		inline bool Get_Exit_Flag();
 
-		//单个线程实际开始工作
-		void *Thread_Work(void *arg);
+		//获取空闲线程队列
+		inline Thread_Queue *Get_Idle_Thread_Queue();
+		
+		//设置线程节点后向指针
+		inline void Set_next(Thread_Node *next);
+		inline Thread_Node *Get_next();
 };	
 
 //线程队列(主要针对空闲线程队列)
 class Thread_Queue{
 	private:
 		//访问修改该线程队列的锁
-		pthread_mutex_t Thread_Queue_Mutex;
+		pthread_mutex_t mutex;
 
 		//线程队列唤醒条件变量
-		pthread_cond_t Thread_Queue_Cond;
+		pthread_cond_t cond;
 
 		//线程队列大小
-		int Thread_Queue_Size;
+		int size;
 
 		//线程队列头尾节点
-		Thread *Head_Thread;
-		Thread *Rear_Thread;
-		
+		Thread_Node *head;
+		Thread_Node *rear;
 	public:
 		Thread_Queue();
 		virtual ~Thread_Queue();
@@ -213,46 +155,69 @@ class Thread_Queue{
 		inline void unlock();
 
 		//获取队列大小
-		inline int Get_Thread_Queue_Size();
-
+		inline int Get_size();
 		//队列大小加一
-		inline void Inc_Thread_Queue_Size();
+		inline void Inc_size();
 		//队列大小减一
-		inline void Dec_Thread_Queue_Size();
+		inline void Dec_size();
 
 		//设置头尾节点
-		inline void Set_Thread_Queue_Head(Thread *Head_Thread);
-		inline void Set_Thread_Queue_Rear(Thread *Rear_Thread);
+		inline void Set_head(Thread_Node *head);
+		inline void Set_rear(Thread_Node *rear);
 
 		//获取头尾节点
-		inline Thread *Get_Thread_Queue_Head();
-		inline Thread *Get_Thread_Queue_Rear();
+		inline Thread_Node *Get_head();
+		inline Thread_Node *Get_rear();
 
 		//任务执行完毕，需要将线程加入到空闲线程队列中去
-		void Add_Thread_To_Idle_Queue(Thread *Idle_Thread);
-		
-		//提供外部接口用于外部通知有新的空闲线程到来
-		inline void Signal_New_Thread_Come();
+		void Add_Thread(Thread_Node *pthread);
+
+		//从空闲线程队列中取出一个线程
+		Thread_Node *Get_Thread();
 };
 
 
-//线程池
+//线程池总模块
 class ThreadPool{
 	private:
-		//设置预制线程数大小为100,最大线程数为2000
-		enum Thread_Num{Idle_Thread_Num = 100, Max_Thread_Num = 2000};
+		//设置预制线程数大小为2000
+		enum Thread_Num{Thread_Num = 2000};
+
+		//线程池中所有线程的数量
+		int Total_Thread;
 		
 		//空闲线程队列
 		Thread_Queue *Idle_Thread_Queue;
 
 		//任务队列
 		Task_Queue	*Ready_Task;
+
+		//线程池管理线程
+		pthread_t Manager_ThreadPool_Pid;
+
+		//线程池监控线程
+		pthread_t Monitor_ThreadPool_Pid;
+
+		//线程池管理线程,本线程完成将任务队列中的任务加入到线程池中
+		static void *Manager_ThreadPool(void *arg);
+
+		//线程池监控线程，本线程完成监控空闲线程大小，根据情况增减空闲线程
+		static void *Monitor_ThreadPool(void *arg);
 	public:
 		ThreadPool();
 		virtual ~ThreadPool();
+		inline Thread_Queue *Get_Idle_Thread_Queue();
+		inline Task_Queue *Get_Ready_Task();
+		
+		inline int Get_Total_Thread();
+		inline void Inc_Total_Thread();
+		inline void Dec_Total_Thread();
+
+		void Clear_Thread();
+		void Add_Thread();
 
 		//向线程池中加入任务
-		int Add_Task_To_ThreadPool();
+		bool Add_Task_To_ThreadPool(Task_Node *task);
 };
 
 #endif

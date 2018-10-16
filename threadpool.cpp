@@ -1,507 +1,192 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "threadpool.h"
 
-////////////////////////////////////////////////////////////////
-//	C语言版本
-////////////////////////////////////////////////////////////////
-
-pthread_queue *pthread_queue_idle;
-
-int pthread_pool_size = THREAD_DEF_NUM;
-
-pthread_t pthread_manager_pid;
-pthread_t monitor_pthread_pool_pid;
-task_queue *waiting_task_queue;
-
-void *single_pthread_work(void * arg)
-{
-	pthread_detach(pthread_self());
-
-	pthread_node *self = (pthread_node *)arg;
-
-	pthread_mutex_lock(&self->mutex);
-	self->pid = pthread_self();
-	pthread_mutex_unlock(&self->mutex);
-
-	while(1)
-	{
-		pthread_mutex_lock(&self->mutex);
-		if(self->task == NULL)
-		{
-			pthread_cond_wait(&self->cond, &self->mutex);
-			if(self->pthread_exit_flag == 1)
-			{
-				pthread_mutex_unlock(&self->mutex);
-				pthread_mutex_destroy(&self->mutex);
-				pthread_cond_destroy(&self->cond);
-				free(self);
-
-				return (void *)0;
-			}
-		}
-		
-		pthread_mutex_lock(&self->task->mutex);
-		self->task->func(self->task->arg);
-		free(self->task->arg);
-		self->task->arg = NULL;
-		
-		pthread_mutex_unlock(&self->task->mutex);
-		pthread_mutex_destroy(&self->task->mutex);
-
-		free(self->task);
-		self->task = NULL;
-		self->is_execute_task = 0;
-		
-		pthread_mutex_lock(&pthread_queue_idle->mutex);
-		if(pthread_queue_idle->pthread_queue_size == 0)
-		{
-			pthread_queue_idle->head = pthread_queue_idle->rear = self;
-			self->next = NULL;
-		}else
-		{
-			pthread_mutex_lock(&pthread_queue_idle->rear->mutex);
-			pthread_queue_idle->rear->next = self;
-			pthread_mutex_unlock(&pthread_queue_idle->rear->mutex);
-
-			self->next = NULL;
-			pthread_queue_idle->rear = self;
-		}
-
-		pthread_queue_idle->pthread_queue_size++;
-		pthread_mutex_unlock(&pthread_queue_idle->mutex);
-		
-		pthread_mutex_unlock(&self->mutex);
-
-		pthread_mutex_lock(&pthread_queue_idle->mutex);
-		if(pthread_queue_idle->pthread_queue_size == 0)
-		{
-			pthread_cond_signal(&pthread_queue_idle->cond);
-		}
-		pthread_mutex_unlock(&pthread_queue_idle->mutex);
-	}
-	return (void *)0;
-}
-
-int create_pthread_pool()
-{
-	pthread_node *pre_pthread;
-	pthread_node *next_pthread;
-
-	int i;
-	for(i = 0; i < pthread_pool_size; i++)
-	{
-		next_pthread = (pthread_node *)malloc(sizeof(pthread_node));
-		if(i == 0)
-		{
-			next_pthread->pid = 0;
-			next_pthread->is_execute_task = 0;
-			next_pthread->pthread_exit_flag = 0;
-			next_pthread->task = NULL;
-			next_pthread->next = NULL;
-			pthread_cond_init(&next_pthread->cond, NULL);
-			pthread_mutex_init(&next_pthread->mutex, NULL);
-			pthread_create(&next_pthread->pid, NULL, single_pthread_work, next_pthread);
-
-			pthread_queue_idle->head = pre_pthread = next_pthread;
-
-			continue;
-		}
-
-		if(i == pthread_pool_size - 1)
-		{
-			next_pthread->pid = 0;
-			next_pthread->is_execute_task = 0;
-			next_pthread->pthread_exit_flag = 0;
-			next_pthread->task = NULL;
-			next_pthread->next = NULL;
-
-			pthread_mutex_lock(&pre_pthread->mutex);
-			pre_pthread->next = next_pthread;
-			pthread_mutex_unlock(&pre_pthread->mutex);
-
-			pthread_cond_init(&next_pthread->cond, NULL);
-			pthread_mutex_init(&next_pthread->mutex, NULL);
-			pthread_create(&next_pthread->pid, NULL, single_pthread_work, next_pthread);
-
-			pthread_queue_idle->rear = pre_pthread = next_pthread;
-
-			continue;
-		}
-
-		next_pthread->pid = 0;
-		next_pthread->is_execute_task = 0;
-		next_pthread->pthread_exit_flag = 0;
-		next_pthread->task = NULL;
-
-		pthread_mutex_lock(&pre_pthread->mutex);
-		pre_pthread->next = next_pthread;
-		pthread_mutex_unlock(&pre_pthread->mutex);
-
-		pthread_cond_init(&next_pthread->cond, NULL);
-		pthread_mutex_init(&next_pthread->mutex, NULL);
-		pthread_create(&next_pthread->pid, NULL, single_pthread_work, next_pthread);
-
-		pre_pthread = next_pthread;
-	}
-	pthread_queue_idle->pthread_queue_size = pthread_pool_size;
-
-	return 0;
-}
-
-void *pthread_manager(void * arg)
-{
-	pthread_detach(pthread_self());
-	while(1)
-	{
-		sem_wait(&waiting_task_queue->NewTaskToExecute);
-		pthread_node *temp_pthread = NULL;
-		task_node *temp_task = NULL;
-		pthread_mutex_lock(&waiting_task_queue->mutex);
-		temp_task = waiting_task_queue->head;
-		if(waiting_task_queue->task_queue_size == 1)
-		{
-			waiting_task_queue->head =waiting_task_queue->rear = NULL;
-		}else
-		{
-			waiting_task_queue->head = temp_task->next;
-		}
-
-		waiting_task_queue->task_queue_size--;
-
-		pthread_mutex_unlock(&waiting_task_queue->mutex);
-		
-		pthread_mutex_lock(&pthread_queue_idle->mutex);
-
-		if(pthread_queue_idle->pthread_queue_size == 0)
-		{
-			pthread_cond_wait(&pthread_queue_idle->cond, &pthread_queue_idle->mutex);
-		}
-
-		temp_pthread = pthread_queue_idle->head;
-		if(pthread_queue_idle->pthread_queue_size == 1)
-		{
-			pthread_queue_idle->head = pthread_queue_idle->rear = NULL;
-		}else
-		{
-			pthread_mutex_lock(&temp_pthread->mutex);
-			pthread_queue_idle->head = temp_pthread->next;
-			pthread_mutex_unlock(&temp_pthread->mutex);
-		}
-
-		pthread_queue_idle->pthread_queue_size--;
-		pthread_mutex_unlock(&pthread_queue_idle->mutex);
-
-		temp_task->pid = temp_pthread->pid;
-		temp_task->next = NULL;
-		temp_task->is_work = 1;
-
-		pthread_mutex_lock(&temp_pthread->mutex);
-		temp_pthread->is_execute_task = 1;
-		temp_pthread->task = temp_task;
-		temp_pthread->next = NULL;
-		pthread_cond_signal(&temp_pthread->cond);
-		pthread_mutex_unlock(&temp_pthread->mutex);
-	}
-	return (void *)0;
-}
-
-int init_pthread_pool()
-{
-	pthread_queue_idle = (pthread_queue *)malloc(sizeof(pthread_queue));
-	pthread_queue_idle->pthread_queue_size = 0;
-	pthread_queue_idle->head = pthread_queue_idle->rear = NULL;
-	pthread_mutex_init(&pthread_queue_idle->mutex, NULL);
-	pthread_cond_init(&pthread_queue_idle->cond, NULL);
-	
-	waiting_task_queue = (task_queue *)malloc(sizeof(task_queue));
-	waiting_task_queue->head = waiting_task_queue->rear = NULL;
-	waiting_task_queue->task_queue_size = 0;
-	pthread_mutex_init(&waiting_task_queue->mutex, NULL);
-	sem_init(&waiting_task_queue->NewTaskToExecute, 0, 0);
-	
-	create_pthread_pool();
-	
-	pthread_create(&pthread_manager_pid, NULL, pthread_manager, NULL);
-	
-	return 0;
-}
-
-int AddTaskToQueue(task_node * NewTask)
-{
-	pthread_mutex_init(&NewTask->mutex, NULL);
-	NewTask->pid = 0;
-	NewTask->is_work = 0;
-	NewTask->next = NULL;
-	
-	pthread_mutex_lock(&waiting_task_queue->mutex);
-	NewTask->work_id = waiting_task_queue->task_queue_size + 1;
-	if(NewTask->work_id > TASK_MAX_NUM)
-	{
-		pthread_mutex_unlock(&waiting_task_queue->mutex);
-		printf("threadpool.c, int AddTaskToQueue(task_node * NewTask):task is too much\n");
-		pthread_mutex_destroy(&NewTask->mutex);
-		free(NewTask->arg);
-		free(NewTask);
-		return -1;
-	}
-	if(waiting_task_queue->task_queue_size == 0)
-	{
-		waiting_task_queue->head = waiting_task_queue->rear = NewTask;
-		NewTask->next  = NULL;
-		waiting_task_queue->task_queue_size++;
-	}else
-	{
-		NewTask->next  = NULL;
-		pthread_mutex_lock(&waiting_task_queue->rear->mutex);
-		waiting_task_queue->rear->next = NewTask;
-		pthread_mutex_unlock(&waiting_task_queue->rear->mutex);
-
-		waiting_task_queue->rear = NewTask;
-		waiting_task_queue->task_queue_size++;
-	}
-	sem_post(&waiting_task_queue->NewTaskToExecute);
-	pthread_mutex_unlock(&waiting_task_queue->mutex);
-
-	return 0;
-}
-
-void monitor_pthread_pool()
-{
-	int i = 0;
-	pthread_node *temp_pthread = NULL;
-	
-	pthread_mutex_lock(&pthread_queue_idle->mutex);
-	//printf("threadpool.c, we have %d thread work!\n", pthread_pool_size -  pthread_queue_idle->pthread_queue_size);
-	if(pthread_queue_idle->pthread_queue_size >  THREAD_IDLE_REDUNDANCE_MAX)
-	{
-		while(pthread_queue_idle->pthread_queue_size > THREAD_IDLE_REDUNDANCE_MAX/2)
-		{
-			temp_pthread = pthread_queue_idle->head;
-			pthread_mutex_lock(&temp_pthread->mutex);
-			pthread_queue_idle->head = temp_pthread->next;
-			temp_pthread->pthread_exit_flag = 1;
-			pthread_cond_signal(&temp_pthread->cond);
-			pthread_mutex_unlock(&temp_pthread->mutex);
-			pthread_queue_idle->pthread_queue_size--;
-			pthread_pool_size--;
-		}
-	}else if(pthread_queue_idle->pthread_queue_size < THREAD_IDLE_REDUNDANCE_MIN)
-	{
-		if(pthread_queue_idle->pthread_queue_size == 0)
-		{
-			temp_pthread =(pthread_node *)malloc(sizeof(pthread_node));
-			
-			temp_pthread->pid = 0;
-			temp_pthread->is_execute_task = 0;
-			temp_pthread->pthread_exit_flag = 0;
-			temp_pthread->task = NULL;
-			temp_pthread->next = NULL;
-			
-			pthread_queue_idle->head = pthread_queue_idle->rear = temp_pthread;
-			
-
-			pthread_cond_init(&temp_pthread->cond, NULL);
-			pthread_mutex_init(&temp_pthread->mutex, NULL);
-			pthread_create(&temp_pthread->pid, NULL, single_pthread_work, temp_pthread);
-			pthread_queue_idle->pthread_queue_size++;
-			pthread_pool_size++;
-		}
-
-		for(i = 0; i < 10; i++)
-		{
-			temp_pthread = (pthread_node *)malloc(sizeof(pthread_node));
-			
-			temp_pthread->pid = 0;
-			temp_pthread->is_execute_task = 0;
-			temp_pthread->pthread_exit_flag = 0;
-			temp_pthread->task = NULL;
-			temp_pthread->next = NULL;
-			
-			pthread_mutex_lock(&pthread_queue_idle->rear->mutex);
-			pthread_queue_idle->rear = temp_pthread;
-			pthread_mutex_unlock(&pthread_queue_idle->rear->mutex);
-			
-			pthread_cond_init(&temp_pthread->cond, NULL);
-			pthread_mutex_init(&temp_pthread->mutex, NULL);
-			pthread_create(&temp_pthread->pid, NULL, single_pthread_work, temp_pthread);
-			pthread_queue_idle->pthread_queue_size++;
-			pthread_pool_size++;
-		}
-	}else
-	{
-		//printf("threadpool.c, void monitor_pthread_pool():threadpool work well!\n");
-	}
-	pthread_mutex_unlock(&pthread_queue_idle->mutex);
-}
-
-
-////////////////////////////////////////////////////////////////
-//	C++语言版本
-////////////////////////////////////////////////////////////////
 Task_Node::Task_Node()
 {
-	pthread_mutex_init(&Task_Node_Mutex, NULL);
+	pthread_mutex_init(&mutex, NULL);
+	arg = NULL;
+	next = NULL;
 }
 
 Task_Node::~Task_Node()
 {
-	pthread_mutex_destroy(&Task_Node_Mutex);
+	pthread_mutex_destroy(&mutex);
 }
 
-inline void Task_Node::Set_Thread_ID(pthread_t Thread_ID)
+inline void Task_Node::lock()
 {
-	this->Thread_ID = Thread_ID;
+	pthread_mutex_lock(&mutex);
 }
 
-inline void Task_Node::Set_Task_ID(int Task_ID)
+inline void Task_Node::unlock()
 {
-	this->Task_ID = Task_ID;
+	pthread_mutex_unlock(&mutex);
 }
 
-inline void Task_Node::Set_Is_Work(bool Is_Task_Work)
+inline void Task_Node::Set_next(Task_Node *next)
 {
-	this->Is_Task_Work = Is_Task_Work;
+	this->next = next;
 }
 
-inline void Task_Node::Set_Next_Task(Task_Node *Next_Task)
+inline Task_Node *Task_Node::Get_next()
 {
-	this->Next_Task = Next_Task;
+	return next;
 }
 
-inline void Task_Node::Set_Task_Arg(void *Task_Arg)
+inline void Task_Node::Set_arg(void *arg)
 {
-	this->Task_Arg = Task_Arg;
+	this->arg = arg;
 }
 
-inline void *Task_Node::Get_Task_Arg()
+inline void *Task_Node::Get_arg()
 {
-	return this->Task_Arg;
+	return this->arg;
 }
+
 
 Task_Queue::Task_Queue()
 {
-	Task_Queue_Size = 0;
-	pthread_mutex_init(&Task_Queue_Mutex, NULL);	
-	sem_init(&Task_To_Execute, 0, 0);
-	Head_Task = NULL;
-	Rear_Task = NULL;	
+	pthread_mutex_init(&mutex, NULL);	
+	size = 0;
+	sem_init(&sem, 0, 0);
+	head = rear = NULL;	
 }
 
-virtual Task_Queue::~Task_Queue()
+Task_Queue::~Task_Queue()
 {
-	pthread_mutex_destroy(&Task_Queue_Mutex);
-	sem_destroy(&Task_To_Execute);
+	pthread_mutex_destroy(&mutex);
+	sem_destroy(&sem);
 }
+
 inline void Task_Queue::lock()
 {
-	pthread_mutex_lock(&Task_Queue_Mutex);
+	pthread_mutex_lock(&mutex);
 }
+
 inline void Task_Queue::wait()
 {
-	sem_wait(&Task_To_Execute);
+	sem_wait(&sem);
 }
+
 inline void Task_Queue::post()
 {
-	sem_post(&Task_To_Execute);
+	sem_post(&sem);
 }
+
 inline void Task_Queue::unlock()
 {
-	pthread_mutex_unlock(&Task_Queue_Mutex);
+	pthread_mutex_unlock(&mutex);
 }
 
-inline int Task_Queue::Get_Task_Queue_Size()
+inline int Task_Queue::Get_size()
 {
-	return Task_Queue_Size;
-}
-inline void Task_Queue::Inc_Task_Queue_Size()
-{
-	Task_Queue_Size++;
-}
-inline void Task_Queue::Dec_Task_Queue_Size()
-{
-	Task_Queue_Size--;
+	return size;
 }
 
-void Task_Queue::Add_Task(Task_Node *Temp_Task)
+inline void Task_Queue::Inc_size()
 {
-	pthread_mutex_init(&NewTask->mutex, NULL);
-	NewTask->pid = 0;
-	NewTask->is_work = 0;
-	NewTask->next = NULL;
-	
-	pthread_mutex_lock(&waiting_task_queue->mutex);
-	NewTask->work_id = waiting_task_queue->task_queue_size + 1;
-	if(NewTask->work_id > TASK_MAX_NUM)
+	size++;
+}
+
+inline void Task_Queue::Dec_size()
+{
+	size--;
+}
+
+/*
+	向线程池任务队列中加入任务，
+	成功：返回0， 
+	失败：返回-1，
+	本模块不对任务节点内存进行释放，需要有接口使用者自行处理
+*/
+bool Task_Queue::Add_Task(Task_Node *task)
+{
+	lock();
+	if(Get_size() > Task_Max_Num)
 	{
-		pthread_mutex_unlock(&waiting_task_queue->mutex);
-		printf("threadpool.c, int AddTaskToQueue(task_node * NewTask):task is too much\n");
-		pthread_mutex_destroy(&NewTask->mutex);
-		free(NewTask->arg);
-		free(NewTask);
-		return -1;
-	}
-	if(waiting_task_queue->task_queue_size == 0)
+		unlock();
+		printf("Task_Queue::Add_Task(Task_Node *Temp_Task):task is too much, please wait......\n");
+		return false;
+	}else if(Get_size() == 0)
 	{
-		waiting_task_queue->head = waiting_task_queue->rear = NewTask;
-		NewTask->next  = NULL;
-		waiting_task_queue->task_queue_size++;
+		head = rear = task;
+		task->Set_next(NULL);
+		Inc_size();
 	}else
 	{
-		NewTask->next  = NULL;
-		pthread_mutex_lock(&waiting_task_queue->rear->mutex);
-		waiting_task_queue->rear->next = NewTask;
-		pthread_mutex_unlock(&waiting_task_queue->rear->mutex);
+		task->Set_next(NULL);
+		//修改任务队列尾节点的相关属性
+		rear->lock();
+		rear->Set_next(task);
+		rear->unlock();
 
-		waiting_task_queue->rear = NewTask;
-		waiting_task_queue->task_queue_size++;
-	}
-	sem_post(&waiting_task_queue->NewTaskToExecute);
-	pthread_mutex_unlock(&waiting_task_queue->mutex);
-
-	return 0;
-
-	Temp_Task->Set_Task_ID(Get_Task_Queue_Size() + 1);
-	if(Get_Task_Queue_Size() + 1 > Task_Max_Num)
-	{
-		
+		rear = task;
+		Inc_size();
 	}
 	
+	post();
+	unlock();
+	return true;
 }
 
+/*
+	本函数完成从任务队列中取出一个任务节点
+*/
 Task_Node *Task_Queue::Get_Task()
 {
+	//等待任务到来
+	wait();
+
+	//读取头节点
+	Task_Node *Task_To_Execute;
 	
+	lock();
+	Task_To_Execute = head;
+	//判断当前任务队列的状态
+	if(Get_size() == 1)
+	{
+		head = rear = NULL;
+	}else
+	{
+		head->lock();
+		head = head->Get_next();
+		head->unlock();
+	}
+	//刷新队列大小
+	Dec_size();
+	unlock();
+
+	return Task_To_Execute;
 }
 
-Thread::Thread(Thread_Queue *Idle_Thread_Queue)
+
+Thread_Node::Thread_Node(Thread_Queue *Idle_Thread_Queue)
 {
+	//初始化条件变量及锁
+	pthread_cond_init(&cond, NULL);
+	pthread_mutex_init(&mutex, NULL);
+
 	//获取空闲线程队列地址
 	this->Idle_Thread_Queue = Idle_Thread_Queue;
-
-	//初始化条件变量及锁
-	pthread_cond_init(&Thread_Cond, NULL);
-	pthread_mutex_init(&Thread_Mutex, NULL);
-
-
-	//初始化其他属性
-	Is_Execute_Task = false;
-	Thread_Exit_Flag = false;
-	Thread_Task = NULL;
-	Next_Thread = NULL;
-
+	Task_Flag = false;
+	Exit_Flag = false;
+	task = NULL;
+	next = NULL;
+	
 	//启动线程
 	pthread_create(&Thread_Pid, NULL, Thread_Work, this);
 }
 
 //析构函数完成线程退出
-virtual Thread::~Thread()
+Thread_Node::~Thread_Node()
 {
 	//线程退出标志位置1
 	lock();
-	Thread_Exit_Flag == true;;
+	Set_Exit_Flag(true);
 	//通知线程退出
 	signal();
 	unlock();
@@ -510,68 +195,92 @@ virtual Thread::~Thread()
 	pthread_join(Thread_Pid, NULL);
 
 	//销毁锁及条件变量
-	pthread_mutex_destroy(&Thread_Mutex);
-	pthread_cond_destroy(&Thread_Cond);
+	pthread_mutex_destroy(&mutex);
+	pthread_cond_destroy(&cond);
 }
 
-inline void Thread::lock()
+inline void Thread_Node::lock()
 {
-	pthread_mutex_lock(&Thread_Mutex);
-}
-inline void Thread::wait()
-{
-	pthread_cond_wait(&Thread_Cond, &Thread_Mutex);
-}
-inline void Thread::signal()
-{
-	pthread_cond_signal(&Thread_Cond);
-}
-inline void Thread::unlock()
-{
-	pthread_mutex_unlock(&Thread_Mutex);
+	pthread_mutex_lock(&mutex);
 }
 
-inline void Thread::Set_Thread_Task(Task_Node *Thread_Task)
+inline void Thread_Node::wait()
 {
-	this->Thread_Task = Thread_Task;
+	pthread_cond_wait(&cond, &mutex);
 }
 
-inline bool Thread::Set_Execute_Task_Flag(bool Is_Execute_Task)
+inline void Thread_Node::signal()
 {
-	this->Is_Execute_Task = Is_Execute_Task;
+	pthread_cond_signal(&cond);
 }
 
-inline bool Thread::Get_Execute_Task_Flag()
+inline void Thread_Node::unlock()
 {
-	return this->Is_Execute_Task;
+	pthread_mutex_unlock(&mutex);
 }
 
-inline bool Thread::Set_Thread_Exit(bool Thread_Exit_Flag)
+inline void Thread_Node::Set_task(Task_Node *task)
 {
-	this->Thread_Exit_Flag = Thread_Exit_Flag;
+	if(task == NULL)
+	{
+		this->task = task;
+		Set_Task_Flag(false);
+	}else
+	{
+		lock();
+		this->task = task;
+		Set_Task_Flag(true);
+		signal();
+		unlock();
+	}
 }
 
-inline bool Thread::Get_Thread_Exit()
+inline void Thread_Node::Set_Task_Flag(bool Task_Flag)
 {
-	return Thread_Exit_Flag;
+	this->Task_Flag = Task_Flag;
 }
 
-inline void Thread::Set_Next_Thread(Thread *Next_Thread)
+inline bool Thread_Node::Get_Task_Flag()
 {
-	this->Next_Thread = Next_Thread;
+	return Task_Flag;
 }
 
-void *Thread::Thread_Work(void *arg)
+inline void Thread_Node::Set_Exit_Flag(bool Exit_Flag)
 {
-	Thread *MyThread = (Thread *)arg;
+	this->Exit_Flag = Exit_Flag;
+}
+
+inline bool Thread_Node::Get_Exit_Flag()
+{
+	return Exit_Flag;
+}
+
+inline Thread_Queue *Thread_Node::Get_Idle_Thread_Queue()
+{
+	return Idle_Thread_Queue;
+}
+
+inline void Thread_Node::Set_next(Thread_Node *next)
+{
+	this->next = next;
+}
+
+inline Thread_Node *Thread_Node::Get_next()
+{
+	return next;
+}
+
+void *Thread_Node::Thread_Work(void *arg)
+{
+	Thread_Node *MyThread = (Thread_Node *)arg;
 	
 	while(1)
 	{
 		MyThread->lock();
-		if(MyThread->Get_Execute_Task_Flag())
+		if(MyThread->Get_Task_Flag() == false)
 		{
 			MyThread->wait();
-			if(Get_Thread_Exit())
+			if(MyThread->Get_Exit_Flag() == true)
 			{
 				MyThread->unlock();
 				return (void *)0;
@@ -579,196 +288,237 @@ void *Thread::Thread_Work(void *arg)
 		}
 
 		//执行分配给该线程的任务
-		MyThread->Thread_Task->run(MyThread->Thread_Task->Get_Task_Arg());
+		MyThread->task->run();
+	
 
 		//任务执行完毕，释放任务节点，重置线程任务
-		delete MyThread->Thread_Task;
-		MyThread->Set_Thread_Task(NULL);
+		delete MyThread->task;
+	
+		MyThread->Set_task(NULL);
+		MyThread->Set_next(NULL);
 	
 		//将本线程加入到空闲线程队列中去
-		MyThread->Add_Thread_To_Idle_Queue();
+		MyThread->Get_Idle_Thread_Queue()->Add_Thread(MyThread);
 	
 		//解锁
 		MyThread->unlock();
-
-		//告知有新的空闲线程到来。
-		Idle_Thread_Queue->Signal_New_Thread_Come();
 	}
 	return (void *)0;
 }
 
+
+
 Thread_Queue::Thread_Queue()
 {
-	pthread_mutex_init(&Thread_Queue_Mutex, NULL);
-	pthread_cond_init(&Thread_Queue_Cond, NULL);
+	pthread_mutex_init(&mutex, NULL);
+	pthread_cond_init(&cond, NULL);
 
-	Thread_Queue_Size = 0;
-	Head_Thread = NULL;
-	Rear_Thread = NULL;
+	size = 0;
+	head = rear = NULL;
 }
 
-virtual Thread_Queue::~Thread_Queue()
+Thread_Queue::~Thread_Queue()
 {
-	//销毁锁及条件变量
-	pthread_mutex_destroy(&Thread_Queue_Mutex);
-	pthread_cond_destroy(&Thread_Queue_Cond);
+
 }
+
 inline void Thread_Queue::lock()
 {
-	pthread_mutex_lock(&Thread_Queue_Mutex);
+	pthread_mutex_lock(&mutex);
 }
+
 inline void Thread_Queue::wait()
 {
-	pthread_cond_wait(&Thread_Queue_Cond, &Thread_Queue_Mutex);	
+	pthread_cond_wait(&cond, &mutex);	
 }
+
 inline void Thread_Queue::signal()
 {
-	pthread_cond_signal(&Thread_Queue_Cond);
+	pthread_cond_signal(&cond);
 }
+
 inline void Thread_Queue::unlock()
 {
-	pthread_mutex_unlock(&Thread_Queue_Mutex);
+	pthread_mutex_unlock(&mutex);
 }
 
-inline int Thread_Queue::Get_Thread_Queue_Size()
+inline int Thread_Queue::Get_size()
 {	
-	return Thread_Queue_Size;
+	return size;
 }
 
-inline void Thread_Queue::Inc_Thread_Queue_Size()
+inline void Thread_Queue::Inc_size()
 {
-	Thread_Queue_Size++;
+	size++;
 }
 
-inline void Thread_Queue::Dec_Thread_Queue_Size()
+inline void Thread_Queue::Dec_size()
 {
-	Thread_Queue_Size--;
+	size--;
 }
 
 //设置头尾节点
-inline void Thread_Queue::Set_Thread_Queue_Head(Thread *Head_Thread)
+inline void Thread_Queue::Set_head(Thread_Node *head)
 {
-	this->Head_Thread = Head_Thread;
-}
-inline void Thread_Queue::Set_Thread_Queue_Rear(Thread *Rear_Thread)
-{
-	this->Rear_Thread = Rear_Thread;
+	this->head = head;
 }
 
-//获取头尾节点
-inline Thread *Thread_Queue::Get_Thread_Queue_Head()
+inline void Thread_Queue::Set_rear(Thread_Node *rear)
 {
-	return Head_Thread;
-}
-inline Thread *Thread_Queue::Get_Thread_Queue_Rear()
-{
-	return Rear_Thread;
+	this->rear = rear;
 }
 
-void Thread_Queue::Add_Thread_To_Idle_Queue(Thread *Idle_Thread);
+inline Thread_Node *Thread_Queue::Get_head()
 {
-	//获取空闲线程队列的访问锁
-	Idle_Thread_Queue->lock();
+	return head;
+}
+
+inline Thread_Node *Thread_Queue::Get_rear()
+{
+	return rear;
+}
+
+void Thread_Queue::Add_Thread(Thread_Node *pthread)
+{
+	//获取当前空闲线程队列的访问锁
+	lock();
 	//判断当前空闲线程队列的大小
-	int Idle_Queue_Size = Idle_Thread_Queue->Get_Thread_Queue_Size();
-	if(Idle_Queue_Size == 0)
+	if(Get_size() == 0)
 	{
-		Idle_Thread_Queue->Set_Thread_Queue_Head(this);
-		Idle_Thread_Queue->Set_Thread_Queue_Rear(this);
-		this->Set_Next_Thread(NULL);
+		head = rear = pthread;
 	}else
 	{
-		//修改末尾线程队列尾节点线程的属性
-		Thread *RearThread = Idle_Thread_Queue->Get_Thread_Queue_Rear();
-		RearThread->lock();
-		//将本线程加入到空闲线程队列中去
-		RearThread->Set_Next_Thread(this);
-		//将空闲线程队列尾节点后向指针置NULL;
-		this->Set_Next_Thread(NULL);
-		RearThread->unlock();
+		rear->lock();
+		rear->Set_next(pthread);
+		rear->unlock();
 
-		//将空闲线程队列尾节点刷新为自己
-		Idle_Thread_Queue->Set_Thread_Queue_Rear(this);
+		rear = pthread;
 	}
-
-	//刷新空闲线程队列大小
-	Idle_Thread_Queue->Inc_Thread_Queue_Size();
-	//释放空闲线程队列锁
-	Idle_Thread_Queue->unlock();
-}
-
-inline void Thread_Queue::Signal_New_Thread_Come()
-{
-	lock();
+	Inc_size();
 	signal();
 	unlock();
 }
 
+//从空闲线程队列中取出一个线程
+Thread_Node *Thread_Queue::Get_Thread()
+{
+	lock();
+	if(Get_size() == 0)
+	{
+		wait();
+	}
+	Thread_Node *Temp_Thread = Get_head();
+	if(Get_size() == 1)
+	{
+		Set_head(NULL);
+		Set_rear(NULL);
+	}else
+	{
+		Temp_Thread->lock();
+		Set_head(Temp_Thread->Get_next());
+		Temp_Thread->unlock();
+	}
+	
+	Dec_size();
+	unlock();
+
+	return Temp_Thread;
+}
+
 ThreadPool::ThreadPool()
 {
+	//初始化空闲线程队列
 	Idle_Thread_Queue = new Thread_Queue(); 
-	
-	Thread *pre_pthread;
-	Thread *next_pthread;
+	//初始化任务队列
+	Ready_Task = new Task_Queue();
 
-	for(int i = 0; i < Idle_Thread_Num; i++)
+	Total_Thread = Thread_Num;
+	
+	//预制线程池
+	for(int i = 0; i < Thread_Num; i++)
 	{
-		next_pthread = new Thread();
-		if(i == 0)
-		{
-			Idle_Thread_Queue->
-			continue;
-		}
-
-		if(i == pthread_pool_size - 1)
-		{
-			next_pthread->pid = 0;
-			next_pthread->is_execute_task = 0;
-			next_pthread->pthread_exit_flag = 0;
-			next_pthread->task = NULL;
-			next_pthread->next = NULL;
-
-			pthread_mutex_lock(&pre_pthread->mutex);
-			pre_pthread->next = next_pthread;
-			pthread_mutex_unlock(&pre_pthread->mutex);
-
-			pthread_cond_init(&next_pthread->cond, NULL);
-			pthread_mutex_init(&next_pthread->mutex, NULL);
-			pthread_create(&next_pthread->pid, NULL, single_pthread_work, next_pthread);
-
-			pthread_queue_idle->rear = pre_pthread = next_pthread;
-
-			continue;
-		}
-
-		next_pthread->pid = 0;
-		next_pthread->is_execute_task = 0;
-		next_pthread->pthread_exit_flag = 0;
-		next_pthread->task = NULL;
-
-		pthread_mutex_lock(&pre_pthread->mutex);
-		pre_pthread->next = next_pthread;
-		pthread_mutex_unlock(&pre_pthread->mutex);
-
-		pthread_cond_init(&next_pthread->cond, NULL);
-		pthread_mutex_init(&next_pthread->mutex, NULL);
-		pthread_create(&next_pthread->pid, NULL, single_pthread_work, next_pthread);
-
-		pre_pthread = next_pthread;
+		Idle_Thread_Queue->Add_Thread(new Thread_Node(Idle_Thread_Queue));
 	}
-	pthread_queue_idle->pthread_queue_size = pthread_pool_size;
+	
+	//开启线程池管理线程
+	pthread_create(&Manager_ThreadPool_Pid, NULL, Manager_ThreadPool, this);
 
-	return 0;
+	//开启线程池监控线程
+	pthread_create(&Monitor_ThreadPool_Pid, NULL, Monitor_ThreadPool, this);
 }
 
-virtual ThreadPool::~ThreadPool()
+ThreadPool::~ThreadPool()
 {
 	
 }
 
-ThreadPool::AddTask()
+inline Thread_Queue *ThreadPool::Get_Idle_Thread_Queue()
 {
-	
+	return Idle_Thread_Queue;
 }
 
+inline Task_Queue *ThreadPool::Get_Ready_Task()
+{
+	return Ready_Task;
+}
+
+inline int ThreadPool::Get_Total_Thread()
+{
+	return Total_Thread;
+}
+
+inline void ThreadPool::Inc_Total_Thread()
+{
+	Total_Thread++;
+}
+
+inline void ThreadPool::Dec_Total_Thread()
+{
+	Total_Thread--;
+}
+
+bool ThreadPool::Add_Task_To_ThreadPool(Task_Node *task)
+{
+	return Ready_Task->Add_Task(task);
+}
+
+void *ThreadPool::Manager_ThreadPool(void *arg)
+{
+	ThreadPool *MyThreadPool = (ThreadPool *)arg;
+	while(1)
+	{
+		Task_Node *Task_To_Execute = MyThreadPool->Get_Ready_Task()->Get_Task();
+		MyThreadPool->Get_Idle_Thread_Queue()->Get_Thread()->Set_task(Task_To_Execute);
+	}
+	return (void *)0;
+}
+
+void *ThreadPool::Monitor_ThreadPool(void *arg)
+{
+	ThreadPool *MyThreadPool = (ThreadPool *)arg;
+	while(1)
+	{
+		printf("Total_Thread:%d, Idle_Thread:%d\n",MyThreadPool->Get_Total_Thread(), MyThreadPool->Get_Idle_Thread_Queue()->Get_size());
+		sleep(1);
+	}
+	return (void *)0;
+}
+
+void ThreadPool::Clear_Thread()
+{
+	for(int i = 0;i < 100; i++)
+	{
+		delete Idle_Thread_Queue->Get_Thread();
+		Dec_Total_Thread();
+	}
+}
+
+void ThreadPool::Add_Thread()
+{
+	for(int i = 0; i < 100; i++)
+	{
+		Idle_Thread_Queue->Add_Thread(new Thread_Node(Idle_Thread_Queue));
+		Inc_Total_Thread();
+	}
+}
 
